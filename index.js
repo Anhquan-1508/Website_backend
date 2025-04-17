@@ -3,7 +3,8 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const dotenv = require("dotenv").config();
 const nodemailer = require("nodemailer");
-
+const axios = require("axios");
+const crypto = require("crypto");
 const app = express();
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -23,12 +24,12 @@ app.use(
 );
 
 const PORT = process.env.PORT || 8080;
+
 // Tự động xóa các email chưa xác thực OTP sau 5 phút
 setInterval(async () => {
   try {
     const now = new Date();
     const expiredUsers = await userModel.find({ otpExpiresAt: { $lt: now } });
-
     if (expiredUsers.length > 0) {
       const userIds = expiredUsers.map((user) => user._id);
       await userModel.deleteMany({ _id: { $in: userIds } });
@@ -119,6 +120,133 @@ const discountSchema = mongoose.Schema({
   usageLimit: { type: Number, required: true },
 });
 const discountModel = mongoose.model("Discount", discountSchema);
+
+// --- Thêm các API cho PayOS ---
+const router = express.Router();
+const PAYOS_API_KEY = process.env.PAYOS_API_KEY;
+const PAYOS_CLIENT_ID = process.env.PAYOS_CLIENT_ID; // Thêm client-id
+const PAYOS_ENDPOINT = "https://api-merchant.payos.vn/v2/payment-requests";
+
+router.post("/api/create-payos-payment", async (req, res) => {
+  try {
+    const { totalPrice } = req.body; // Nhận tổng tiền từ frontend
+    const expiredAt = Math.floor(Date.now() / 1000) + 3600; // Hết hạn sau 1 giờ
+    const orderCode = Math.floor(Math.random() * 1000000000); // Mã đơn hàng số nguyên
+
+    const payload = {
+      amount: totalPrice,
+      description: "Thanh toán đơn hàng",
+      returnUrl: `${process.env.FRONTEND_URL}/success`, // URL khi thanh toán thành công
+      cancelUrl: `${process.env.FRONTEND_URL}/cancel`, // URL khi người dùng hủy
+      failedUrl: `${process.env.FRONTEND_URL}/failed`, // URL khi thanh toán thất bại
+      orderCode: orderCode,
+      expiredAt: expiredAt,
+    };
+
+    //  **Tạo chữ ký signature** (Sort theo alphabet như tài liệu PayOS)
+    const dataString = `amount=${payload.amount}&cancelUrl=${payload.cancelUrl}&description=${payload.description}&orderCode=${payload.orderCode}&returnUrl=${payload.returnUrl}`;
+    const signature = crypto
+      .createHmac("sha256", process.env.PAYOS_CHECKSUM_KEY)
+      .update(dataString)
+      .digest("hex");
+
+    // Gửi request đến PayOS
+    const response = await axios.post(
+      PAYOS_ENDPOINT,
+      { ...payload, signature }, // Thêm signature vào payload
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": PAYOS_API_KEY,
+          "x-client-id": PAYOS_CLIENT_ID,
+          // "x-partner-code": PAYOS_PARTNER_CODE,
+        },
+      }
+    );
+
+    // Kiểm tra và trả checkoutUrl về cho frontend
+    if (response.data && response.data.data && response.data.data.checkoutUrl) {
+      console.log("✅ Đã tạo phiên thanh toán thành công:", response.data);
+      res.json({ checkoutUrl: response.data.data.checkoutUrl });
+    } else {
+      console.error("❌ Lỗi khi tạo phiên thanh toán PayOS:", response.data);
+      res.status(500).json({ error: "Không thể tạo phiên thanh toán PayOS." });
+    }
+  } catch (error) {
+    console.error("❌ Lỗi khi gọi API PayOS:", error);
+    res
+      .status(500)
+      .json({ error: "Đã xảy ra lỗi khi tạo yêu cầu thanh toán." });
+  }
+});
+router.post("/api/payos-webhook", async (req, res) => {
+  try {
+    const { status, orderCode, signature } = req.body; // Nhận dữ liệu từ webhook
+
+    console.log(
+      `Webhook PayOS: Trạng thái = ${status}, Mã đơn hàng = ${orderCode}`
+    );
+    // **Xác thực webhook với signature**
+    const secret = process.env.PAYOS_API_SECRET; // Lấy khóa bí mật từ env
+    const dataString = `orderCode=${orderCode}&status=${status}`; // Dữ liệu để tạo chữ ký
+    const expectedSignature = crypto
+      .createHmac("sha256", secret)
+      .update(dataString)
+      .digest("hex");
+
+    if (signature !== expectedSignature) {
+      console.warn("⚠️ Cảnh báo: Webhook PayOS có chữ ký không hợp lệ!");
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+
+    console.log("✅ Webhook hợp lệ, tiến hành xử lý...");
+
+    // **Xử lý thanh toán theo trạng thái**
+    if (status === "COMPLETED") {
+      console.log(`✅ Đơn hàng ${orderCode} đã thanh toán thành công.`);
+      // TODO: Cập nhật database, gửi email xác nhận...
+    } else if (status === "FAILED") {
+      console.log(`❌ Đơn hàng ${orderCode} thanh toán thất bại.`);
+    } else if (status === "CANCELLED") {
+      console.log(`🚫 Đơn hàng ${orderCode} đã bị hủy.`);
+    } else if (status === "PENDING") {
+      console.log(`⏳ Đơn hàng ${orderCode} đang chờ xử lý.`);
+    }
+
+    return res.sendStatus(200); // Xác nhận với PayOS webhook đã được xử lý
+  } catch (error) {
+    console.error("❌ Lỗi khi xử lý webhook PayOS:", error);
+    return res.sendStatus(500);
+  }
+});
+
+const updateWebhookUrl = async () => {
+  try {
+    const response = await axios.post(
+      "https://api-merchant.payos.vn/confirm-webhook",
+      {
+        webhookUrl: "http://localhost:3030/api/payos-webhook", // Thay bằng URL webhook của bạn
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "x-client-id": process.env.PAYOS_CLIENT_ID, // Client ID từ PayOS
+          "x-api-key": process.env.PAYOS_API_KEY, // API Key từ PayOS
+        },
+      }
+    );
+
+    console.log("✅ Webhook URL đã được cập nhật:", response.data);
+  } catch (error) {
+    console.error(
+      "❌ Lỗi khi cập nhật Webhook URL:",
+      error.response?.data || error
+    );
+  }
+};
+
+// Gọi hàm để cập nhật Webhook URL
+updateWebhookUrl();
 
 // APIs
 app.get("/", (req, res) => {
@@ -284,34 +412,33 @@ app.get("/product", async (req, res) => {
     res.status(500).send({ message: "Failed to fetch products" });
   }
 });
-app.post('/uploadProduct', async (req, res) => {
+app.post("/uploadProduct", async (req, res) => {
   console.log(req.body);
   const data = productModel(req.body);
   const datasave = await data.save();
-  res.send({ message: 'Upload successfully' });
+  res.send({ message: "Upload successfully" });
 });
 
-app.get('/product/search', async (req, res) => {
+app.get("/product/search", async (req, res) => {
   try {
     const { name } = req.query;
 
-    if (!name || name.trim() === '') {
-      console.log('Search term missing');
-      return res.status(400).json({ error: 'Search term is required' });
+    if (!name || name.trim() === "") {
+      console.log("Search term missing");
+      return res.status(400).json({ error: "Search term is required" });
     }
 
     // Sử dụng regex để tìm kiếm sản phẩm theo tên
-    const query = { name: { $regex: name, $options: 'i'  } }; // options: i => không phân biệt chữ hoa, chữ thường
-    const data = await productModel.find(query); 
+    const query = { name: { $regex: name, $options: "i" } }; // options: i => không phân biệt chữ hoa, chữ thường
+    const data = await productModel.find(query);
     // console.log('Search Query:', query); // Log query để kiểm tra
     // console.log('Search Results:', data); // Log kết quả từ database
-    res.status(200).json(data); 
+    res.status(200).json(data);
   } catch (error) {
-    console.error('Error searching for products:', error);
-    res.status(500).json({ error: 'Failed to search for products' });
+    console.error("Error searching for products:", error);
+    res.status(500).json({ error: "Failed to search for products" });
   }
 });
-
 
 // Discount APIs
 app.post("/uploadDiscount", async (req, res) => {
@@ -396,15 +523,15 @@ app.get("/get-contacts", async (req, res) => {
 });
 
 // API gửi OTP
-app.post('/forgot-password', async (req, res) => {
+app.post("/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
     const user = await userModel.findOne({ email });
 
     if (!user) {
-      return res.status(404).json({ 
-        message: 'Email không tồn tại trong hệ thống', 
-        alert: false 
+      return res.status(404).json({
+        message: "Email không tồn tại trong hệ thống",
+        alert: false,
       });
     }
 
@@ -421,7 +548,7 @@ app.post('/forgot-password', async (req, res) => {
     const mailOptions = {
       from: process.env.EMAIL_USER,
       to: email,
-      subject: 'Mã OTP đặt lại mật khẩu',
+      subject: "Mã OTP đặt lại mật khẩu",
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <h2>Mã OTP đặt lại mật khẩu của bạn</h2>
@@ -429,40 +556,39 @@ app.post('/forgot-password', async (req, res) => {
           <p>Mã này sẽ hết hạn sau 5 phút.</p>
           <p>Nếu bạn không yêu cầu đặt lại mật khẩu, vui lòng bỏ qua email này.</p>
         </div>
-      `
+      `,
     };
 
     await transporter.sendMail(mailOptions);
 
-    res.json({ 
-      message: 'Mã OTP đã được gửi đến email của bạn',
-      alert: true 
+    res.json({
+      message: "Mã OTP đã được gửi đến email của bạn",
+      alert: true,
     });
-
   } catch (error) {
-    console.error('Forgot password error:', error);
-    res.status(500).json({ 
-      message: 'Đã có lỗi xảy ra, vui lòng thử lại sau',
-      alert: false 
+    console.error("Forgot password error:", error);
+    res.status(500).json({
+      message: "Đã có lỗi xảy ra, vui lòng thử lại sau",
+      alert: false,
     });
   }
 });
 
 // API đặt lại mật khẩu với OTP
-app.post('/reset-password', async (req, res) => {
+app.post("/reset-password", async (req, res) => {
   try {
     const { email, otp, newPassword } = req.body;
 
     const user = await userModel.findOne({
       email,
       resetOtp: otp,
-      resetOtpExpires: { $gt: Date.now() }
+      resetOtpExpires: { $gt: Date.now() },
     });
 
     if (!user) {
-      return res.status(400).json({ 
-        message: 'Mã OTP không hợp lệ hoặc đã hết hạn',
-        alert: false 
+      return res.status(400).json({
+        message: "Mã OTP không hợp lệ hoặc đã hết hạn",
+        alert: false,
       });
     }
 
@@ -473,54 +599,16 @@ app.post('/reset-password', async (req, res) => {
     user.resetOtpExpires = undefined;
     await user.save();
 
-    res.json({ 
-      message: 'Đặt lại mật khẩu thành công',
-      alert: true 
+    res.json({
+      message: "Đặt lại mật khẩu thành công",
+      alert: true,
     });
-
   } catch (error) {
-    console.error('Reset password error:', error);
-    res.status(500).json({ 
-      message: 'Đã có lỗi xảy ra, vui lòng thử lại sau',
-      alert: false 
+    console.error("Reset password error:", error);
+    res.status(500).json({
+      message: "Đã có lỗi xảy ra, vui lòng thử lại sau",
+      alert: false,
     });
-  }
-});
-// payment api
-// mock payment endpoint
-app.post('/create-mock-checkout-session', async (req, res) => {
-  try {
-    const items = req.body;
-    if (!items || items.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "Cart is empty. Please add items to cart." });
-    }
-    if (items.length < 2) {
-      return res.status(400).json({
-        error: "Insufficient items for checkout. Minimum 2 items required.",
-      });
-    }
-    const totalAmount = items.reduce(
-      (acc, item) => acc + item.price * item.qty,
-      0
-    );
-    if (totalAmount < 15) {
-      return res
-        .status(400)
-        .json({ error: "Total amount is too low for checkout." });
-    }
-    const mockSession = {
-      sessionId: "mock_session_id_123456",
-      message: "This is a mock payment session",
-      paymentUrl: `${process.env.FRONTEND_URL}/success`,
-      cancelUrl: `${process.env.FRONTEND_URL}/cancel`,
-    };
-
-    res.status(200).json(mockSession);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "An error occurred in the mock payment" });
   }
 });
 
@@ -579,7 +667,7 @@ app.post("/update-customer-info", async (req, res) => {
     const { fullName, email, phone, address, dob } = req.body;
 
     // Kiểm tra dữ liệu có đủ không
-    if ( !fullName || !email || !phone || !address || !dob) {
+    if (!fullName || !email || !phone || !address || !dob) {
       return res.status(400).json({ message: "All fields are required." });
     }
 
@@ -603,13 +691,13 @@ app.post("/update-customer-info", async (req, res) => {
 });
 
 // API để lấy tất cả thông tin khách hàng
-app.get('/get-customer-info/:id', async (req, res) => {
+app.get("/get-customer-info/:id", async (req, res) => {
   try {
     // Tìm khách hàng theo email
     const customer = await updateInfoModel.findOne({ email: req.params.email });
 
     if (!customer) {
-      return res.status(404).json({ message: 'Customer not found' });
+      return res.status(404).json({ message: "Customer not found" });
     }
 
     res.status(200).json(customer);
@@ -619,7 +707,6 @@ app.get('/get-customer-info/:id', async (req, res) => {
   }
 });
 
-
-
 //Gửi kết nối messages phản hồi với database
-app.listen(PORT, () => console.log("Server is running at port : " + PORT));
+app.use("/", router);
+app.listen(8080, () => console.log("Server is running at port : " + PORT));
